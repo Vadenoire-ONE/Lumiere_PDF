@@ -126,13 +126,13 @@ class SplitDialog(tk.Toplevel):
         top = ttk.Frame(self, padding=8)
         top.pack(side=tk.TOP, fill=tk.X)
         ttk.Label(top, text="Режим сохранения:").pack(side=tk.LEFT)
-        self.mode_var = tk.StringVar(value="per_page")
+        self.mode_var = tk.StringVar(value="by_format")
+        ttk.Radiobutton(top, text="Группировать по формату",
+                        variable=self.mode_var, value="by_format").pack(side=tk.LEFT, padx=6)
         ttk.Radiobutton(top, text="Каждая страница — отдельный PDF",
                         variable=self.mode_var, value="per_page").pack(side=tk.LEFT, padx=6)
         ttk.Radiobutton(top, text="Все выбранные — в один PDF",
                         variable=self.mode_var, value="single").pack(side=tk.LEFT, padx=6)
-        ttk.Radiobutton(top, text="Группировать по формату",
-                        variable=self.mode_var, value="by_format").pack(side=tk.LEFT, padx=6)
 
         # --- Панель действий выбора ---
         actions = ttk.Frame(self, padding=(8, 0))
@@ -364,6 +364,8 @@ class LumierePDF(tk.Tk):
         tools_menu.add_separator()
         tools_menu.add_command(label="Извлечь текст…", command=self.extract_text)
         tools_menu.add_command(label="Извлечь изображения…", command=self.extract_images)
+        tools_menu.add_separator()
+        tools_menu.add_command(label="Подготовить для NotebookLM…", command=self.export_for_notebooklm)
         tools_menu.add_separator()
         tools_menu.add_command(label="Информация о страницах (форматы)", command=self.show_page_formats)
         menubar.add_cascade(label="Инструменты", menu=tools_menu)
@@ -850,6 +852,142 @@ class LumierePDF(tk.Tk):
                 f.write(text)
             self.status_var.set(f"Текст сохранён: {os.path.basename(out)}")
             messagebox.showinfo("Готово", f"Текст сохранён:\n{out}")
+        except Exception as exc:
+            messagebox.showerror("Ошибка", f"Не удалось сохранить:\n{exc}")
+
+    # ---- Экспорт для NotebookLM --------------------------------------------
+
+    def export_for_notebooklm(self) -> None:
+        """Подготовить загруженный PDF к загрузке в NotebookLM.
+
+        NotebookLM лучше всего работает с текстовыми источниками. Этот
+        экспорт извлекает текст постранично и сохраняет аккуратный
+        Markdown-файл с разделителями страниц и заголовком документа.
+        Если PDF — скан без текстового слоя, программа предложит
+        сохранить уменьшенную копию PDF (NotebookLM сам распознает её).
+        """
+        if self.doc is None:
+            messagebox.showinfo("NotebookLM", "Сначала откройте PDF.")
+            return
+
+        doc_ref = self.doc
+        src_path = self.pdf_path or "document.pdf"
+        base = os.path.splitext(os.path.basename(src_path))[0]
+
+        def worker() -> None:
+            try:
+                pages_text: List[str] = []
+                empty_pages = 0
+                total_chars = 0
+                for i, page in enumerate(doc_ref, start=1):
+                    t = (page.get_text("text") or "").strip()
+                    if not t:
+                        empty_pages += 1
+                    total_chars += len(t)
+                    pages_text.append(t)
+
+                page_count = doc_ref.page_count
+                has_text = total_chars > 100 and empty_pages < page_count
+
+                self.after(0, lambda: self._finish_notebooklm_export(
+                    base, src_path, pages_text, empty_pages, page_count, has_text,
+                ))
+            except Exception as exc:
+                self.after(0, lambda: messagebox.showerror(
+                    "Ошибка", f"Не удалось подготовить файл:\n{exc}"))
+
+        self.status_var.set("Подготовка для NotebookLM…")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_notebooklm_export(
+        self,
+        base: str,
+        src_path: str,
+        pages_text: List[str],
+        empty_pages: int,
+        page_count: int,
+        has_text: bool,
+    ) -> None:
+        if self.doc is None:
+            return
+
+        # Скан / нет текстового слоя — предложить сохранить PDF-копию
+        if not has_text:
+            ok = messagebox.askyesno(
+                "NotebookLM",
+                "В этом PDF почти нет текстового слоя (похоже на скан).\n\n"
+                "Сохранить очищенную копию PDF для загрузки в NotebookLM?\n"
+                "(NotebookLM сам распознает текст из скана.)",
+            )
+            if not ok:
+                self.status_var.set("Отменено")
+                return
+            out = filedialog.asksaveasfilename(
+                title="Сохранить PDF для NotebookLM",
+                defaultextension=".pdf",
+                filetypes=[("PDF", "*.pdf")],
+                initialfile=f"{base}_notebooklm.pdf",
+            )
+            if not out:
+                self.status_var.set("Отменено")
+                return
+            try:
+                # garbage=4 + deflate ужимают файл
+                self.doc.save(out, garbage=4, deflate=True, clean=True)
+                self.status_var.set(f"Сохранено для NotebookLM: {os.path.basename(out)}")
+                messagebox.showinfo("Готово", f"Файл готов к загрузке в NotebookLM:\n{out}")
+            except Exception as exc:
+                messagebox.showerror("Ошибка", f"Не удалось сохранить PDF:\n{exc}")
+            return
+
+        # Есть текст — собираем Markdown
+        meta = self.doc.metadata or {}
+        title = (meta.get("title") or base).strip() or base
+        author = (meta.get("author") or "").strip()
+
+        header_lines = [f"# {title}", ""]
+        if author:
+            header_lines.append(f"_Автор:_ {author}")
+        header_lines.append(f"_Источник:_ {os.path.basename(src_path)}")
+        header_lines.append(f"_Страниц:_ {page_count}")
+        header_lines.append("")
+        header_lines.append("---")
+        header_lines.append("")
+
+        body_parts: List[str] = []
+        for i, txt in enumerate(pages_text, start=1):
+            body_parts.append(f"## Страница {i}")
+            body_parts.append("")
+            body_parts.append(txt if txt else "_(пустая страница)_")
+            body_parts.append("")
+
+        content = "\n".join(header_lines) + "\n".join(body_parts)
+
+        words = len(content.split())
+        warn = ""
+        if empty_pages:
+            warn += f"\nПустых страниц: {empty_pages} из {page_count}."
+        if words > 450_000:
+            warn += f"\nВ файле ~{words:,} слов — близко к лимиту NotebookLM (500 000)."
+
+        out = filedialog.asksaveasfilename(
+            title="Сохранить для NotebookLM",
+            defaultextension=".md",
+            filetypes=[("Markdown", "*.md"), ("Текст", "*.txt")],
+            initialfile=f"{base}_notebooklm.md",
+        )
+        if not out:
+            self.status_var.set("Отменено")
+            return
+        try:
+            with open(out, "w", encoding="utf-8") as f:
+                f.write(content)
+            self.status_var.set(f"Готово для NotebookLM: {os.path.basename(out)}")
+            messagebox.showinfo(
+                "Готово",
+                f"Файл готов к загрузке в NotebookLM:\n{out}\n\n"
+                f"Слов: ~{words:,}, страниц: {page_count}." + warn,
+            )
         except Exception as exc:
             messagebox.showerror("Ошибка", f"Не удалось сохранить:\n{exc}")
 
