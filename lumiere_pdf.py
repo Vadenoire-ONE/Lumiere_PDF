@@ -305,6 +305,7 @@ class SplitDialog(tk.Toplevel):
             return
 
         mode = self.mode_var.get()
+        labels: Optional[List[str]] = None
         if mode == "per_page":
             groups = [[i] for i in chosen]
         elif mode == "single":
@@ -313,14 +314,16 @@ class SplitDialog(tk.Toplevel):
             buckets: dict[str, List[int]] = {}
             for i in chosen:
                 buckets.setdefault(self.page_formats[i], []).append(i)
-            groups = [sorted(v) for v in buckets.values()]
+            items = sorted(buckets.items(), key=lambda kv: kv[1][0])
+            groups = [sorted(v) for _, v in items]
+            labels = [fmt for fmt, _ in items]
         else:
             groups = [chosen]
 
         out_dir = filedialog.askdirectory(title="Папка для сохранения частей", parent=self)
         if not out_dir:
             return
-        self.app._run_split(groups, out_dir)
+        self.app._run_split(groups, out_dir, labels=labels)
         self.destroy()
 
 class LumierePDF(tk.Tk):
@@ -357,6 +360,7 @@ class LumierePDF(tk.Tk):
         tools_menu = tk.Menu(menubar, tearoff=0)
         tools_menu.add_command(label="Объединить PDF…", command=self.merge_pdfs)
         tools_menu.add_command(label="Разделить PDF…", command=self.split_pdf)
+        tools_menu.add_command(label="Разделить по формату листа", command=self.split_by_format)
         tools_menu.add_separator()
         tools_menu.add_command(label="Извлечь текст…", command=self.extract_text)
         tools_menu.add_command(label="Извлечь изображения…", command=self.extract_images)
@@ -719,12 +723,56 @@ class LumierePDF(tk.Tk):
             return
         SplitDialog(self)
 
-    def _run_split(self, groups: List[List[int]], out_dir: str) -> None:
-        """Сохранить группы страниц в отдельные PDF в out_dir."""
+    def split_by_format(self) -> None:
+        """Автоматически разделить весь документ по формату листа."""
+        if self.doc is None:
+            messagebox.showinfo("Разделение", "Сначала откройте PDF.")
+            return
+
+        buckets: dict[str, List[int]] = {}
+        for i in range(self.doc.page_count):
+            r = self.doc.load_page(i).rect
+            fmt = detect_paper_format(r.width, r.height)
+            buckets.setdefault(fmt, []).append(i)
+
+        if len(buckets) <= 1:
+            only = next(iter(buckets), "—")
+            messagebox.showinfo(
+                "Разделение по формату",
+                f"В документе только один формат: {only}.\nРазделение не требуется.",
+            )
+            return
+
+        summary = "\n".join(f"  • {fmt}: {len(pages)} стр." for fmt, pages in buckets.items())
+        if not messagebox.askyesno(
+            "Разделение по формату",
+            f"Найдено форматов: {len(buckets)}\n{summary}\n\nСоздать по одному PDF на каждый формат?",
+        ):
+            return
+
+        out_dir = filedialog.askdirectory(title="Папка для сохранения частей")
+        if not out_dir:
+            return
+
+        items = sorted(buckets.items(), key=lambda kv: kv[1][0])
+        groups = [sorted(pages) for _, pages in items]
+        labels = [fmt for fmt, _ in items]
+        self._run_split(groups, out_dir, labels=labels)
+
+    def _run_split(self, groups: List[List[int]], out_dir: str,
+                   labels: Optional[List[str]] = None) -> None:
+        """Сохранить группы страниц в отдельные PDF в out_dir.
+
+        Если переданы labels — они используются как суффикс имени файла."""
         if self.doc is None or not groups or not out_dir:
             return
         base = os.path.splitext(os.path.basename(self.pdf_path or "document.pdf"))[0]
         doc_ref = self.doc
+
+        def safe(name: str) -> str:
+            for ch in '<>:"/\\|?*':
+                name = name.replace(ch, "_")
+            return name.strip().replace(" ", "_") or "part"
 
         def worker() -> None:
             try:
@@ -735,7 +783,9 @@ class LumierePDF(tk.Tk):
                     new = fitz.open()
                     for p in pages:
                         new.insert_pdf(doc_ref, from_page=p, to_page=p)
-                    if len(pages) == 1:
+                    if labels and i - 1 < len(labels) and labels[i - 1]:
+                        suffix = safe(labels[i - 1])
+                    elif len(pages) == 1:
                         suffix = f"page{pages[0] + 1}"
                     elif _is_contiguous(pages):
                         suffix = f"part{i}_p{pages[0] + 1}-{pages[-1] + 1}"
