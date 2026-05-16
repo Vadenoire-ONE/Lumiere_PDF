@@ -98,6 +98,230 @@ class ViewState:
     page_index: int = 0
     zoom: float = 1.25
 
+def _is_contiguous(pages: List[int]) -> bool:
+    return all(pages[i] + 1 == pages[i + 1] for i in range(len(pages) - 1))
+
+
+class SplitDialog(tk.Toplevel):
+    """Диалог разделения PDF: выбор страниц вручную или по формату."""
+
+    def __init__(self, app: "LumierePDF") -> None:
+        super().__init__(app)
+        self.app = app
+        self.doc = app.doc
+        assert self.doc is not None
+
+        self.title("Разделить PDF")
+        self.geometry("640x540")
+        self.transient(app)
+        self.grab_set()
+
+        # --- Собираем форматы страниц ---
+        self.page_formats: List[str] = []
+        for i in range(self.doc.page_count):
+            r = self.doc.load_page(i).rect
+            self.page_formats.append(detect_paper_format(r.width, r.height))
+
+        # --- Верхняя панель: режим вывода ---
+        top = ttk.Frame(self, padding=8)
+        top.pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(top, text="Режим сохранения:").pack(side=tk.LEFT)
+        self.mode_var = tk.StringVar(value="per_page")
+        ttk.Radiobutton(top, text="Каждая страница — отдельный PDF",
+                        variable=self.mode_var, value="per_page").pack(side=tk.LEFT, padx=6)
+        ttk.Radiobutton(top, text="Все выбранные — в один PDF",
+                        variable=self.mode_var, value="single").pack(side=tk.LEFT, padx=6)
+        ttk.Radiobutton(top, text="Группировать по формату",
+                        variable=self.mode_var, value="by_format").pack(side=tk.LEFT, padx=6)
+
+        # --- Панель действий выбора ---
+        actions = ttk.Frame(self, padding=(8, 0))
+        actions.pack(side=tk.TOP, fill=tk.X)
+        ttk.Button(actions, text="Выбрать все", command=self._select_all).pack(side=tk.LEFT, padx=2)
+        ttk.Button(actions, text="Снять все", command=self._select_none).pack(side=tk.LEFT, padx=2)
+        ttk.Button(actions, text="Инвертировать", command=self._invert).pack(side=tk.LEFT, padx=2)
+
+        ttk.Separator(actions, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+        ttk.Label(actions, text="По формату:").pack(side=tk.LEFT)
+        self.format_var = tk.StringVar()
+        formats_unique = sorted(set(self.page_formats))
+        self.format_combo = ttk.Combobox(
+            actions, textvariable=self.format_var, values=formats_unique,
+            state="readonly", width=24,
+        )
+        if formats_unique:
+            self.format_combo.current(0)
+        self.format_combo.pack(side=tk.LEFT, padx=4)
+        ttk.Button(actions, text="Выбрать", command=self._select_by_format).pack(side=tk.LEFT, padx=2)
+        ttk.Button(actions, text="Добавить", command=lambda: self._select_by_format(add=True)).pack(side=tk.LEFT, padx=2)
+
+        # --- Диапазоны ---
+        ranges = ttk.Frame(self, padding=(8, 4))
+        ranges.pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(ranges, text="Диапазоны (например 1-3,5,7-9):").pack(side=tk.LEFT)
+        self.range_var = tk.StringVar()
+        ttk.Entry(ranges, textvariable=self.range_var, width=28).pack(side=tk.LEFT, padx=4)
+        ttk.Button(ranges, text="Применить", command=self._apply_range).pack(side=tk.LEFT)
+
+        # --- Таблица страниц ---
+        table_frame = ttk.Frame(self, padding=(8, 4))
+        table_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        cols = ("sel", "page", "format")
+        self.tree = ttk.Treeview(table_frame, columns=cols, show="headings", selectmode="extended")
+        self.tree.heading("sel", text="✓")
+        self.tree.heading("page", text="Стр.")
+        self.tree.heading("format", text="Формат")
+        self.tree.column("sel", width=40, anchor="center", stretch=False)
+        self.tree.column("page", width=70, anchor="center", stretch=False)
+        self.tree.column("format", width=300, anchor="w")
+
+        vsb = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.selected: List[bool] = [False] * self.doc.page_count
+        self.iids: List[str] = []
+        for i in range(self.doc.page_count):
+            iid = self.tree.insert("", tk.END, values=("", i + 1, self.page_formats[i]))
+            self.iids.append(iid)
+
+        self.tree.bind("<Button-1>", self._on_click)
+        self.tree.bind("<space>", self._on_space)
+        self.tree.bind("<Double-Button-1>", self._on_double_click)
+
+        # По умолчанию — выбраны все
+        self._select_all()
+
+        # --- Низ: статус и кнопки ---
+        bottom = ttk.Frame(self, padding=8)
+        bottom.pack(side=tk.BOTTOM, fill=tk.X)
+        self.status_var = tk.StringVar()
+        ttk.Label(bottom, textvariable=self.status_var).pack(side=tk.LEFT)
+        ttk.Button(bottom, text="Отмена", command=self.destroy).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(bottom, text="Сохранить…", command=self._on_save).pack(side=tk.RIGHT, padx=2)
+
+        self._update_status()
+
+    # ---- helpers ----
+    def _update_status(self) -> None:
+        n = sum(self.selected)
+        self.status_var.set(f"Выбрано страниц: {n} из {self.doc.page_count}")
+
+    def _refresh_row(self, idx: int) -> None:
+        mark = "✓" if self.selected[idx] else ""
+        self.tree.set(self.iids[idx], "sel", mark)
+
+    def _refresh_all(self) -> None:
+        for i in range(len(self.selected)):
+            self._refresh_row(i)
+        self._update_status()
+
+    def _toggle(self, idx: int) -> None:
+        self.selected[idx] = not self.selected[idx]
+        self._refresh_row(idx)
+        self._update_status()
+
+    # ---- handlers ----
+    def _on_click(self, event: tk.Event) -> None:
+        region = self.tree.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+        col = self.tree.identify_column(event.x)
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return
+        if col == "#1":  # колонка "sel"
+            try:
+                idx = self.iids.index(row)
+            except ValueError:
+                return
+            self._toggle(idx)
+
+    def _on_space(self, _event: tk.Event) -> None:
+        for row in self.tree.selection():
+            try:
+                idx = self.iids.index(row)
+            except ValueError:
+                continue
+            self._toggle(idx)
+
+    def _on_double_click(self, event: tk.Event) -> None:
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return
+        try:
+            idx = self.iids.index(row)
+        except ValueError:
+            return
+        # Переходим к странице в просмотрщике
+        self.app.view.page_index = idx
+        self.app._render_page()
+
+    def _select_all(self) -> None:
+        self.selected = [True] * len(self.selected)
+        self._refresh_all()
+
+    def _select_none(self) -> None:
+        self.selected = [False] * len(self.selected)
+        self._refresh_all()
+
+    def _invert(self) -> None:
+        self.selected = [not s for s in self.selected]
+        self._refresh_all()
+
+    def _select_by_format(self, add: bool = False) -> None:
+        fmt = self.format_var.get()
+        if not fmt:
+            return
+        if not add:
+            self.selected = [False] * len(self.selected)
+        for i, f in enumerate(self.page_formats):
+            if f == fmt:
+                self.selected[i] = True
+        self._refresh_all()
+
+    def _apply_range(self) -> None:
+        spec = self.range_var.get().strip()
+        if not spec:
+            return
+        try:
+            groups = parse_page_ranges(spec, len(self.selected))
+        except ValueError as exc:
+            messagebox.showerror("Ошибка", str(exc), parent=self)
+            return
+        self.selected = [False] * len(self.selected)
+        for grp in groups:
+            for p in grp:
+                self.selected[p] = True
+        self._refresh_all()
+
+    # ---- save ----
+    def _on_save(self) -> None:
+        chosen = [i for i, s in enumerate(self.selected) if s]
+        if not chosen:
+            messagebox.showinfo("Разделение", "Не выбрано ни одной страницы.", parent=self)
+            return
+
+        mode = self.mode_var.get()
+        if mode == "per_page":
+            groups = [[i] for i in chosen]
+        elif mode == "single":
+            groups = [chosen]
+        elif mode == "by_format":
+            buckets: dict[str, List[int]] = {}
+            for i in chosen:
+                buckets.setdefault(self.page_formats[i], []).append(i)
+            groups = [sorted(v) for v in buckets.values()]
+        else:
+            groups = [chosen]
+
+        out_dir = filedialog.askdirectory(title="Папка для сохранения частей", parent=self)
+        if not out_dir:
+            return
+        self.app._run_split(groups, out_dir)
+        self.destroy()
 
 class LumierePDF(tk.Tk):
     def __init__(self) -> None:
@@ -493,44 +717,30 @@ class LumierePDF(tk.Tk):
         if self.doc is None:
             messagebox.showinfo("Разделение", "Сначала откройте PDF.")
             return
+        SplitDialog(self)
 
-        spec = simpledialog.askstring(
-            "Разделить PDF",
-            f"Документ содержит {self.doc.page_count} страниц.\n\n"
-            "Введите диапазоны (например: 1-3,5,7-9).\n"
-            "Каждый диапазон сохранится в отдельный PDF.\n"
-            "Оставьте пустым, чтобы разделить постранично.",
-            parent=self,
-        )
-        if spec is None:
+    def _run_split(self, groups: List[List[int]], out_dir: str) -> None:
+        """Сохранить группы страниц в отдельные PDF в out_dir."""
+        if self.doc is None or not groups or not out_dir:
             return
-
-        try:
-            if spec.strip():
-                groups = parse_page_ranges(spec, self.doc.page_count)
-            else:
-                groups = [[i] for i in range(self.doc.page_count)]
-        except ValueError as exc:
-            messagebox.showerror("Ошибка", str(exc))
-            return
-
-        out_dir = filedialog.askdirectory(title="Папка для сохранения частей")
-        if not out_dir:
-            return
-
         base = os.path.splitext(os.path.basename(self.pdf_path or "document.pdf"))[0]
+        doc_ref = self.doc
 
         def worker() -> None:
             try:
                 created: List[str] = []
                 for i, pages in enumerate(groups, start=1):
+                    if not pages:
+                        continue
                     new = fitz.open()
                     for p in pages:
-                        new.insert_pdf(self.doc, from_page=p, to_page=p)
+                        new.insert_pdf(doc_ref, from_page=p, to_page=p)
                     if len(pages) == 1:
                         suffix = f"page{pages[0] + 1}"
-                    else:
+                    elif _is_contiguous(pages):
                         suffix = f"part{i}_p{pages[0] + 1}-{pages[-1] + 1}"
+                    else:
+                        suffix = f"part{i}_{len(pages)}pages"
                     out_path = os.path.join(out_dir, f"{base}_{suffix}.pdf")
                     new.save(out_path)
                     new.close()
