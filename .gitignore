@@ -1,0 +1,25 @@
+# Виртуальное окружение
+.venv/
+venv/
+env/
+
+# Артефакты сборки PyInstaller
+build/
+dist/
+*.manifest
+
+# Кэш Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# ОС
+Thumbs.db
+.DS_Store
+
+# Прочее
+*.log
